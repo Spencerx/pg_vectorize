@@ -1,10 +1,9 @@
 use pgrx::*;
-use vectorize_core::types::{
+use vectorize_core::core::types::{
     IndexDist as CoreIndexDist, SimilarityAlg as CoreSimilarityAlg, TableMethod as CoreTableMethod,
 };
 
 use serde::{Deserialize, Serialize};
-pub const VECTORIZE_SCHEMA: &str = "vectorize";
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PostgresEnum, PartialEq, Eq)]
