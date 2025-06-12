@@ -27,26 +27,14 @@ services:
     depends_on:
       - postgres
     build:
-      dockerfile: Dockerfile
-      context: .
+      dockerfile: server/Dockerfile
+      context: ./
     ports:
-      - 8080:8080
+      - 8080:8080 # http server
     environment:
         <<: *default-env
-        RUST_LOG: info
+        RUST_LOG: debug
     command: vectorize-server
-  worker:
-    restart: always
-    logging: *default-logging
-    depends_on:
-      - postgres
-    build:
-      dockerfile: Dockerfile
-      context: .
-    environment:
-        <<: *default-env
-        RUST_LOG: info
-    command: vectorize-worker
   vector-serve:
     restart: always
     logging: *default-logging

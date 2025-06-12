@@ -1,8 +1,8 @@
-use crate::core::{errors::VectorizeError, transformers::types::PairedEmbeddings};
 use anyhow::Result;
 use serde_json::to_string;
 use sqlx::{Pool, Postgres};
 use std::fmt::Write;
+use vectorize_core::{errors::VectorizeError, transformers::types::PairedEmbeddings};
 
 pub async fn upsert_embedding_table(
     conn: &Pool<Postgres>,

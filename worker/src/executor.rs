@@ -1,22 +1,22 @@
-use crate::core::types::JobMessage;
 use pgmq::Message;
 use sqlx::PgPool;
+use vectorize_core::errors::VectorizeError;
+use vectorize_core::types::JobMessage;
 
-use crate::core::transformers::{http_handler, providers, types::Inputs};
-use crate::core::worker::base::Config;
-use crate::core::worker::ops;
-use crate::db;
-use crate::errors::ServerError;
-use crate::init;
+use crate::ops;
 use anyhow::Result;
 use pgmq::PGMQueueExt;
 use tiktoken_rs::cl100k_base;
+use vectorize_core::config::Config;
+use vectorize_core::db;
+use vectorize_core::init;
+use vectorize_core::transformers::{http_handler, providers, types::Inputs};
 
 pub async fn poll_job(
     conn: &PgPool,
     queue: &PGMQueueExt,
     config: &Config,
-) -> Result<Option<()>, ServerError> {
+) -> Result<Option<()>, VectorizeError> {
     let msg: Message<JobMessage> = match queue.read::<JobMessage>(&config.queue_name, 300_i32).await
     {
         Ok(Some(msg)) => msg,
@@ -56,13 +56,13 @@ pub async fn poll_job(
         );
     }
 
-    queue.archive(&config.queue_name, msg_id).await?;
+    queue.delete(&config.queue_name, msg_id).await?;
 
     Ok(Some(()))
 }
 
 /// processes a single job from the queue
-async fn execute_job(pool: &PgPool, msg: Message<JobMessage>) -> Result<(), ServerError> {
+async fn execute_job(pool: &PgPool, msg: Message<JobMessage>) -> Result<(), VectorizeError> {
     let bpe = cl100k_base().unwrap();
 
     let job_name = msg.message.job_name.clone();
