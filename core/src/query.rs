@@ -59,6 +59,76 @@ pub fn init_index_query(job_name: &str, idx_type: &str, job_params: &JobParams) 
     )
 }
 
+pub fn create_fts_index_query(job_name: &str, idx_type: &str) -> String {
+    check_input(job_name).expect("invalid job name");
+    match idx_type.to_uppercase().as_str() {
+        "GIN" | "GIST" => {} // Do nothing, it's valid
+        _ => panic!("Expected 'GIN' or 'GIST', got '{}' index type", idx_type),
+    }
+    format!(
+        "CREATE INDEX IF NOT EXISTS {job_name}_{index}_idx ON vectorize._search_tokens_{job_name}
+        USING {index} (search_tokens);",
+        job_name = job_name,
+        index = idx_type
+    )
+}
+
+pub fn update_search_tokens_trigger_queries(
+    job_name: &str,
+    join_key: &str,
+    src_schema: &str,
+    src_table: &str,
+    src_column: &str,
+) -> Vec<String> {
+    let trigger_fn_name = format!("update_{job_name}_search_tokens");
+    let trigger_dev = format!(
+        "
+    CREATE OR REPLACE FUNCTION {trigger_fn_name}()
+    RETURNS TRIGGER AS $$
+    BEGIN
+    -- Handle INSERT and UPDATE operations
+    IF TG_OP = 'INSERT' THEN
+        -- Insert new search tokens record
+        INSERT INTO vectorize._search_tokens_{job_name} ({join_key}, search_tokens)
+        VALUES (
+            NEW.{join_key},
+            to_tsvector('english', COALESCE(NEW.{src_column}, ''))
+        )
+        ON CONFLICT ({join_key}) DO UPDATE SET
+            search_tokens = to_tsvector('english', COALESCE(NEW.{src_column}, '')),
+            updated_at = CLOCK_TIMESTAMP()
+        ;
+        RETURN NEW;
+    END IF;
+
+    IF TG_OP = 'UPDATE' THEN
+        -- Only update if content actually changed
+        IF OLD.{src_column} IS DISTINCT FROM NEW.{src_column} THEN
+            -- Update or insert search tokens
+            INSERT INTO vectorize._search_tokens_{job_name} ({join_key}, search_tokens)
+            VALUES (NEW.{join_key}, to_tsvector('english', COALESCE(NEW.{src_column}, '')))
+            ON CONFLICT ({join_key}) DO UPDATE SET
+                search_tokens = to_tsvector('english', COALESCE(NEW.{src_column}, '')),
+                updated_at = CLOCK_TIMESTAMP();
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;"
+    );
+    let apply_trigger = format!(
+        "
+        CREATE TRIGGER {job_name}_search_tokens_trigger
+        AFTER INSERT OR UPDATE OR DELETE ON {src_schema}.{src_table}
+        FOR EACH ROW
+        EXECUTE FUNCTION {trigger_fn_name}();"
+    );
+    vec![trigger_dev, apply_trigger]
+}
+
 /// creates a project view over a source table and the embeddings table
 pub fn create_project_view(job_name: &str, schema: &str, relation: &str, pkey: &str) -> String {
     format!(
@@ -72,6 +142,29 @@ pub fn create_project_view(job_name: &str, schema: &str, relation: &str, pkey: &
         schema = schema,
         table = relation,
         primary_key = pkey
+    )
+}
+
+pub fn create_search_tokens_table(
+    job_name: &str,
+    join_key: &str,
+    join_key_type: &str,
+    src_schema: &str,
+    src_table: &str,
+) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS vectorize._search_tokens_{job_name} (
+            {join_key} {join_key_type} UNIQUE NOT NULL,
+            search_tokens TSVECTOR NOT NULL,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+            FOREIGN KEY ({join_key}) REFERENCES {src_schema}.{src_table} ({join_key}) ON DELETE CASCADE
+        );
+        ",
+        job_name = job_name,
+        join_key = join_key,
+        join_key_type = join_key_type,
+        src_schema = src_schema,
+        src_table = src_table,
     )
 }
 
@@ -349,6 +442,88 @@ fn prepare_filter(filter: &str, pkey: &str) -> String {
     format!("AND {wc}")
 }
 
+pub fn hybrid_search_query(
+    job_name: &str,
+    src_schema: &str,
+    src_table: &str,
+    join_key: &str,
+    return_columns: &[String],
+    window_size: i32,
+    limit: i32,
+    rrf_k: f32,
+    semantic_weight: f32,
+    fts_weight: f32,
+) -> String {
+    let cols = &return_columns
+        .iter()
+        .map(|s| format!("t0.{}", s))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "
+    SELECT to_jsonb(t) as results 
+    FROM (
+        SELECT {cols}, t.rrf_score, t.semantic_rank, t.fts_rank, t.similarity_score
+        FROM (
+            SELECT
+                COALESCE(s.{join_key}, f.{join_key}) as {join_key},
+                s.semantic_rank,
+                s.similarity_score,
+                f.fts_rank,
+                (
+                    CASE
+                        WHEN s.semantic_rank IS NOT NULL THEN {semantic_weight}::float/({k} + s.semantic_rank)
+                        ELSE 0
+                    END +
+                    CASE
+                        WHEN f.fts_rank IS NOT NULL THEN {fts_weight}::float/({k} + f.fts_rank)
+                        ELSE 0
+                    END
+                ) as rrf_score
+            FROM (
+                SELECT
+                    {join_key},
+                    distance,
+                    ROW_NUMBER() OVER (ORDER BY distance) as semantic_rank,
+                    COUNT(*) OVER () as max_semantic_rank,
+                    1 - distance as similarity_score
+                FROM (
+                    SELECT
+                        {join_key},
+                        embeddings <=> $1::vector as distance
+                    FROM vectorize._embeddings_{job_name}
+                ) sub
+                ORDER BY distance
+                LIMIT {window_size}
+            ) s
+            FULL OUTER JOIN (
+                SELECT
+                    {join_key},
+                    ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_tokens, query) DESC) as fts_rank,
+                    COUNT(*) OVER () as max_fts_rank
+                FROM vectorize._search_tokens_{job_name}, plainto_tsquery('english', $2) as query
+                WHERE search_tokens @@ query
+                ORDER BY ts_rank_cd(search_tokens, query) DESC 
+                LIMIT {window_size}
+            ) f ON s.{join_key} = f.{join_key}
+        ) t
+        INNER JOIN {src_schema}.{src_table} t0 ON t0.{join_key} = t.{join_key}
+        ORDER BY t.rrf_score DESC
+        LIMIT {limit}
+    ) t",
+        job_name = job_name,
+        src_schema = src_schema,
+        src_table = src_table,
+        join_key = join_key,
+        semantic_weight = semantic_weight,
+        fts_weight = fts_weight,
+        window_size = window_size,
+        limit = limit,
+        cols = cols,
+        k = rrf_k
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
