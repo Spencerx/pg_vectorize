@@ -48,8 +48,7 @@ pub async fn get_column_datatype(
     .await
     .map_err(|e| {
         VectorizeError::NotFound(format!(
-            "schema, table or column NOT FOUND for {}.{}.{}: {}",
-            schema, table, column, e
+            "schema, table or column NOT FOUND for {schema}.{table}.{column}: {e}"
         ))
     })?;
 
@@ -82,24 +81,27 @@ pub async fn init_pgmq(pool: &PgPool, conn_string: Option<&str>) -> Result<(), V
     let sql_content = response.text().await?;
 
     if let Some(url) = conn_string {
-        let output = Command::new("psql")
-            .arg(url)
-            .arg("-c")
-            .arg(sql_content)
-            .output()
-            .unwrap();
-        if !output.status.success() {
-            log::error!(
-                "failed to install pgmq: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return Err(VectorizeError::InternalError(anyhow!(
-                "Failed to install pgmq".to_string()
-            )));
-        }
-        log::info!("{}", String::from_utf8_lossy(&output.stdout));
+        exec_psql(url, &sql_content)?;
     }
+    Ok(())
+}
 
+pub fn exec_psql(conn_string: &str, sql_content: &str) -> Result<(), VectorizeError> {
+    let output = Command::new("psql")
+        .arg(conn_string)
+        .arg("-c")
+        .arg(sql_content)
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        log::error!(
+            "failed to execute SQL: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err(VectorizeError::InternalError(anyhow!(
+            "Failed to execute SQL".to_string()
+        )));
+    }
     Ok(())
 }
 
@@ -143,7 +145,7 @@ pub async fn initialize_job(
     .await?;
 
     // create embeddings table and views
-    let col_type = format!("vector({})", model_dim);
+    let col_type = format!("vector({model_dim})");
     let create_embedding_table_query = query::create_embedding_table(
         job_request.job_name.as_str(),
         &job_request.primary_key,

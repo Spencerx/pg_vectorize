@@ -66,10 +66,7 @@ pub async fn start_cache_sync_listener(
         match try_listen_for_changes(&config).await {
             Ok(_) => retry_delay = Duration::from_secs(1),
             Err(e) => {
-                error!(
-                    "Cache sync listener error: {}. Retrying in {:?}",
-                    e, retry_delay
-                );
+                error!("Cache sync listener error: {e}. Retrying in {retry_delay:?}");
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
             }
@@ -106,13 +103,13 @@ async fn try_listen_for_changes(
                 }
 
                 if let Err(e) = refresh_job_cache(config).await {
-                    error!("Failed to refresh job cache: {}", e);
+                    error!("Failed to refresh job cache: {e}");
                 } else {
                     info!("Job cache refreshed successfully");
                 }
             }
             Err(e) => {
-                error!("Error receiving notification: {}", e);
+                error!("Error receiving notification: {e}");
                 return Err(e.into());
             }
         }
