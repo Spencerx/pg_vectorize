@@ -117,3 +117,26 @@ LIMIT 2;"
          35 | Gardening Gloves | Handwear for protection during gardening tasks    | garden           |  8.00 | 2025-06-25 20:27:07.725765+00 |  0.2909192990160845
 (2 rows)
 ```
+
+## Running on an existing Postgres instance
+
+Assuming you have an existing Postgres instance with `pgvector` installed, you can run the HTTP servers using Docker and get started quickly.
+
+Set the following env vars in a `.env` file:
+
+If your embedding model is gated or private on Hugging Face, you will also need to set the `HF_API_KEY` environment variable. Otherwise you can ignore it.
+
+```dotenv
+DATABASE_URL=postgresql://user:password@your-postgres-host:5432/postgres
+HF_API_KEY=your_huggingface_api_key
+```
+
+Then start the search and embedding servers:
+
+```bash
+docker compose up -d
+```
+
+Then generate embeddings and indices as describe [above](#generating-embeddings).
+
+Finally, search using the [HTTP API](#search-with-http-api).
