@@ -7,15 +7,19 @@ use sqlx::PgPool;
 
 use uuid::Uuid;
 
-pub async fn init_project(pool: &PgPool, conn_string: Option<&str>) -> Result<(), VectorizeError> {
+pub async fn init_project(pool: &PgPool) -> Result<(), VectorizeError> {
     // Initialize the pgmq extension
-    init_pgmq(pool, conn_string).await?;
+    init_pgmq(pool).await?;
 
     let statements = vec![
         "CREATE SCHEMA IF NOT EXISTS vectorize;".to_string(),
         "CREATE EXTENSION IF NOT EXISTS vector;".to_string(),
         query::create_vectorize_table(),
         "SELECT pgmq.create('vectorize_jobs');".to_string(),
+        query::handle_table_update(),
+        "ALTER SYSTEM SET vectorize.batch_size = 10000;".to_string(),
+        "SELECT pg_reload_conf();".to_string(),
+        query::create_batch_texts_fn(),
     ];
     for s in statements {
         sqlx::query(&s).execute(pool).await?;
@@ -63,7 +67,7 @@ async fn pgmq_schema_exists(pool: &PgPool) -> Result<bool, sqlx::Error> {
     Ok(row)
 }
 
-pub async fn init_pgmq(pool: &PgPool, conn_string: Option<&str>) -> Result<(), VectorizeError> {
+pub async fn init_pgmq(pool: &PgPool) -> Result<(), VectorizeError> {
     // Check if the pgmq schema already exists
     if pgmq_schema_exists(pool).await? {
         log::info!("pgmq schema already exists, skipping initialization.");
@@ -167,7 +171,7 @@ pub async fn initialize_job(
 
     // create triggers on the source table
     let trigger_handler =
-        query::create_trigger_handler(&job_request.job_name, &job_request.job_name);
+        query::create_trigger_handler(&job_request.job_name, &job_request.primary_key);
     let insert_trigger = query::create_event_trigger(
         &job_request.job_name,
         &job_request.src_schema,
@@ -282,6 +286,6 @@ mod tests {
         env_logger::init();
         let conn_string = "postgresql://postgres:postgres@localhost:5432/postgres";
         let pool = PgPool::connect(conn_string).await.unwrap();
-        init_pgmq(&pool, Some(conn_string)).await.unwrap();
+        init_pgmq(&pool).await.unwrap();
     }
 }
