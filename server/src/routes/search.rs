@@ -1,8 +1,9 @@
 use crate::errors::ServerError;
 use actix_web::{HttpResponse, get, web};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Row};
-use std::collections::HashMap;
+use sqlx::{PgPool, Row, prelude::FromRow};
+use std::collections::{BTreeMap, HashMap};
+
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use utoipa::ToSchema;
@@ -27,7 +28,7 @@ pub struct SearchRequest {
     #[serde(default = "default_fts_wt")]
     pub fts_wt: f32,
     #[serde(flatten, default)]
-    pub filters: HashMap<String, query::FilterValue>,
+    pub filters: BTreeMap<String, query::FilterValue>,
 }
 
 fn default_semantic_wt() -> f32 {
@@ -81,9 +82,9 @@ pub async fn search(
     payload: web::Query<SearchRequest>,
 ) -> Result<HttpResponse, ServerError> {
     let payload = payload.into_inner();
-    query::check_input(&payload.job_name)?;
 
-    // check the filters are valid if they exist and create a SQL string for them
+    // check inputs and filters are valid if they exist and create a SQL string for them
+    query::check_input(&payload.job_name)?;
     if !payload.filters.is_empty() {
         for (key, value) in &payload.filters {
             // validate key and value
@@ -95,18 +96,22 @@ pub async fn search(
         }
     }
 
-    // Try to get job info from cache first, fallback to database
+    // Try to get job info from cache first, fallback to database with write-through on miss
     let vectorizejob = {
-        let job_cache = jobmap.read().await;
-        if let Some(job_info) = job_cache.get(&payload.job_name) {
-            job_info.clone()
+        if let Some(job_info) = {
+            let job_cache = jobmap.read().await;
+            job_cache.get(&payload.job_name).cloned()
+        } {
+            job_info
         } else {
-            // cache miss is going to either be an invalid job name, or there is an issue with the cache
             log::warn!(
                 "Job not found in cache, querying database for job: {}",
                 payload.job_name
             );
-            get_vectorize_job(&pool, &payload.job_name).await?
+            let job = get_vectorize_job(&pool, &payload.job_name).await?;
+            let mut job_cache = jobmap.write().await;
+            job_cache.insert(payload.job_name.clone(), job.clone());
+            job
         }
     };
 
@@ -144,7 +149,7 @@ pub async fn search(
         .bind(&embeddings.embeddings[0])
         .bind(&payload.query);
 
-    // bind filter values in the same order they were processed in hybrid_search_query
+    // Bind filter values using the same BTreeMap instance used by the query builder
     for value in payload.filters.values() {
         prepared_query = value.bind_to_query(prepared_query);
     }
