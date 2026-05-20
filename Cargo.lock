@@ -4254,7 +4254,7 @@ name = "vectorize-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "log",
+ "clap",
  "pgwire",
  "regex",
  "serde_json",

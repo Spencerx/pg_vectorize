@@ -1,9 +1,9 @@
 use crate::embeddings::{
     JobMapEmbeddingProvider, parse_embed_calls, resolve_prepared_embed_calls,
-    rewrite_query_with_embeddings,
+    rewrite_query_with_embeddings, rewrite_search_query,
 };
-use log::info;
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 use super::protocol::{
     BIND_MESSAGE, CLOSE_MESSAGE, DESCRIBE_MESSAGE, EXECUTE_MESSAGE, MIN_MESSAGE_HEADER_SIZE,
@@ -79,10 +79,9 @@ pub fn log_message_processing(parsed: &ParsedMessage) {
         SYNC_MESSAGE => "Sync (Extended Query)",
         _ => "Unknown message type",
     };
-    log::debug!(
+    debug!(
         "Processing message type: {} ({})",
-        message_name,
-        parsed.message_type
+        message_name, parsed.message_type
     );
 
     if parsed.has_embed_calls && parsed.rewritten {
@@ -133,6 +132,31 @@ pub async fn process_simple_query_message(
     if let Some(null_pos) = query_bytes.iter().position(|&b| b == 0) {
         let sql = String::from_utf8_lossy(&query_bytes[..null_pos]).to_string();
 
+        // Check for vectorize.search() calls first — these fully replace the query.
+        {
+            let jobmap_read = config.jobmap.read().await;
+            let embedding_provider = JobMapEmbeddingProvider::new(Arc::new(jobmap_read.clone()));
+            drop(jobmap_read);
+
+            match rewrite_search_query(&sql, &embedding_provider).await {
+                Ok(Some(rewritten_sql)) => {
+                    let rewritten_message = create_query_message(&rewritten_sql);
+                    let parsed = ParsedMessage {
+                        message_type: QUERY_MESSAGE,
+                        sql: Some(rewritten_sql),
+                        has_embed_calls: true,
+                        rewritten: true,
+                    };
+                    return Some((rewritten_message, parsed));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to rewrite vectorize.search() query: {e}");
+                }
+            }
+        }
+
+        // Check for vectorize.embed() calls — these replace only the function call inline.
         if let Ok(embed_calls) = parse_embed_calls(&sql)
             && !embed_calls.is_empty()
         {
@@ -189,6 +213,35 @@ pub async fn process_parse_message(
 
         if offset > query_start {
             let sql = String::from_utf8_lossy(&data[query_start..offset]).to_string();
+
+            {
+                let jobmap_read = config.jobmap.read().await;
+                let embedding_provider =
+                    JobMapEmbeddingProvider::new(Arc::new(jobmap_read.clone()));
+                drop(jobmap_read);
+
+                match rewrite_search_query(&sql, &embedding_provider).await {
+                    Ok(Some(rewritten_sql)) => {
+                        let rewritten_message = create_parse_message_with_rewritten_query(
+                            data,
+                            query_start,
+                            offset,
+                            &rewritten_sql,
+                        );
+                        let parsed = ParsedMessage {
+                            message_type: PARSE_MESSAGE,
+                            sql: Some(rewritten_sql),
+                            has_embed_calls: true,
+                            rewritten: true,
+                        };
+                        return Some((rewritten_message, parsed));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("Failed to rewrite vectorize.search() in Parse: {e}");
+                    }
+                }
+            }
 
             if let Ok(embed_calls) = parse_embed_calls(&sql)
                 && !embed_calls.is_empty()

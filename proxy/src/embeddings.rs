@@ -1,9 +1,30 @@
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
+
+static SEARCH_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)vectorize\.search\s*\(((?:'(?:[^']|'')*'|[^)])*)\)").unwrap()
+});
+static SEARCH_JOB_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)job\s*=>\s*'((?:[^']|'')*)'").unwrap());
+static SEARCH_QUERY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)query\s*=>\s*'((?:[^']|'')*)'").unwrap());
+static SEARCH_NUM_RESULTS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:num_results|limit)\s*=>\s*(\d+)").unwrap());
+static EMBED_STRING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)vectorize\.embed\s*\(\s*'([^']*(?:''[^']*)*)'\s*,\s*'([^']*(?:''[^']*)*)'\s*\)",
+    )
+    .unwrap()
+});
+static EMBED_PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)vectorize\.embed\s*\(\s*\$(\d+)\s*,\s*\$(\d+)\s*\)").unwrap()
+});
 use std::sync::Arc;
 
 use vectorize_core::errors::VectorizeError;
+use vectorize_core::query::hybrid_search_query_rows;
 use vectorize_core::transformers::providers::{self, prepare_generic_embedding_request};
 use vectorize_core::transformers::types::Inputs;
 use vectorize_core::types::VectorizeJob;
@@ -63,24 +84,130 @@ impl JobMapEmbeddingProvider {
     }
 }
 
+/// Represents a parsed vectorize.search() named-argument function call
+#[derive(Debug, Clone)]
+pub struct SearchCall {
+    pub job_name: String,
+    pub query: String,
+    pub num_results: i32,
+    pub full_match: String,
+    pub start_pos: usize,
+    pub end_pos: usize,
+}
+
+/// Parses `vectorize.search(job=>'...', query=>'...')` calls from SQL.
+/// Only named-argument syntax is supported.
+pub fn parse_search_calls(sql: &str) -> Result<Vec<SearchCall>> {
+    let mut calls = Vec::new();
+
+    for mat in SEARCH_CALL_RE.find_iter(sql) {
+        let full_match = mat.as_str().to_string();
+        let args_str = SEARCH_CALL_RE
+            .captures(mat.as_str())
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+
+        let job_name = SEARCH_JOB_RE
+            .captures(args_str)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().replace("''", "'"))
+            .ok_or_else(|| anyhow::anyhow!("Missing 'job' parameter in vectorize.search()"))?;
+
+        let query = SEARCH_QUERY_RE
+            .captures(args_str)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().replace("''", "'"))
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter in vectorize.search()"))?;
+
+        let num_results = SEARCH_NUM_RESULTS_RE
+            .captures(args_str)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(10i32);
+
+        calls.push(SearchCall {
+            job_name,
+            query,
+            num_results,
+            full_match,
+            start_pos: mat.start(),
+            end_pos: mat.end(),
+        });
+    }
+
+    Ok(calls)
+}
+
+/// Detects `vectorize.search()` calls in SQL and rewrites the entire query to the
+/// underlying hybrid search SQL with the embedding vector inlined.
+/// Returns `Ok(None)` if no search calls are found.
+pub async fn rewrite_search_query(
+    sql: &str,
+    provider: &JobMapEmbeddingProvider,
+) -> Result<Option<String>, VectorizeError> {
+    let search_calls = parse_search_calls(sql).map_err(|e| {
+        VectorizeError::EmbeddingGenerationFailed(format!("Failed to parse search calls: {e}"))
+    })?;
+
+    if search_calls.is_empty() {
+        return Ok(None);
+    }
+
+    // Handle the first call (the common case; multiple search calls in one query are unusual)
+    let call = &search_calls[0];
+
+    let vectorize_job = provider.jobmap.get(&call.job_name).ok_or_else(|| {
+        VectorizeError::JobNotFound(format!("Job '{}' not found in proxy cache", call.job_name))
+    })?;
+
+    let embeddings = provider
+        .generate_embeddings(&call.query, &call.job_name)
+        .await?;
+    let embedding_literal = format_embeddings_as_vector(&embeddings);
+
+    let window_size = 5 * call.num_results;
+    let template_sql = hybrid_search_query_rows(
+        &call.job_name, // vectorize_job.job_name was cleared by mem::take in cache load
+        &vectorize_job.src_schema,
+        &vectorize_job.src_table,
+        &vectorize_job.primary_key,
+        &["*".to_string()],
+        window_size,
+        call.num_results,
+        60.0,
+        1.0,
+        1.0,
+        &BTreeMap::new(),
+    );
+
+    // Inline the sqlx bind parameter placeholders with their actual values.
+    // $1::vector is the embedding; $2 is the raw text for the FTS plainto_tsquery.
+    // With no filters, these are the only two bind params in the generated SQL.
+    let escaped_query = call.query.replace('\'', "''");
+    let query_literal = format!("'{escaped_query}'");
+    let inlined_sql = template_sql
+        .replace("$1::vector", &embedding_literal)
+        .replace("$2", &query_literal);
+
+    // Splice the subquery in place of `vectorize.search(...)`, keeping any outer
+    // SELECT column list, WHERE, ORDER BY, or LIMIT the caller wrote.
+    let subquery = format!("({inlined_sql}\n    ) AS _vectorize_search");
+    let mut rewritten = sql.to_string();
+    rewritten.replace_range(call.start_pos..call.end_pos, &subquery);
+    Ok(Some(rewritten))
+}
+
 pub fn parse_embed_calls(sql: &str) -> Result<Vec<EmbedCall>> {
     let mut calls = Vec::new();
 
-    // matches vectorize.embed('query', 'project_name')  string literals only
-    let string_re = Regex::new(
-        r"(?i)vectorize\.embed\s*\(\s*'([^']*(?:''[^']*)*)'\s*,\s*'([^']*(?:''[^']*)*)'\s*\)",
-    )?;
-
-    // matches vectorize.embed($1, $2) prepared statement parameters
-    let param_re = Regex::new(r"(?i)vectorize\.embed\s*\(\s*\$(\d+)\s*,\s*\$(\d+)\s*\)")?;
-
     // Parse string literal calls
-    for mat in string_re.find_iter(sql) {
+    for mat in EMBED_STRING_RE.find_iter(sql) {
         let full_match = mat.as_str().to_string();
         let start_pos = mat.start();
         let end_pos = mat.end();
 
-        if let Some(captures) = string_re.captures(&full_match) {
+        if let Some(captures) = EMBED_STRING_RE.captures(&full_match) {
             let query = captures.get(1).unwrap().as_str().replace("''", "'");
             let project_name = captures.get(2).unwrap().as_str().replace("''", "'");
 
@@ -98,12 +225,12 @@ pub fn parse_embed_calls(sql: &str) -> Result<Vec<EmbedCall>> {
     }
 
     // parse prepared statement parameter calls
-    for mat in param_re.find_iter(sql) {
+    for mat in EMBED_PARAM_RE.find_iter(sql) {
         let full_match = mat.as_str().to_string();
         let start_pos = mat.start();
         let end_pos = mat.end();
 
-        if let Some(captures) = param_re.captures(&full_match) {
+        if let Some(captures) = EMBED_PARAM_RE.captures(&full_match) {
             // convert 1-based indices to 0-based (e.g. bind parameters from $1 -> 0)
             let query_param_index = captures.get(1).unwrap().as_str().parse::<usize>()? - 1;
             let project_param_index = captures.get(2).unwrap().as_str().parse::<usize>()? - 1;
@@ -240,5 +367,66 @@ mod tests {
         let sql = "SELECT * FROM documents WHERE id = 1";
         let calls = parse_embed_calls(sql).unwrap();
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_search_calls_basic() {
+        let sql = "SELECT * FROM vectorize.search(job=>'my_job', query=>'camping backpack')";
+        let calls = parse_search_calls(sql).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].job_name, "my_job");
+        assert_eq!(calls[0].query, "camping backpack");
+        assert_eq!(calls[0].num_results, 10);
+    }
+
+    #[test]
+    fn test_parse_search_calls_with_num_results() {
+        let sql = "SELECT * FROM vectorize.search(job=>'my_job', query=>'camping backpack', num_results=>5)";
+        let calls = parse_search_calls(sql).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].num_results, 5);
+    }
+
+    #[test]
+    fn test_parse_search_calls_with_limit_alias() {
+        let sql =
+            "SELECT * FROM vectorize.search(job=>'my_job', query=>'camping backpack', limit=>3)";
+        let calls = parse_search_calls(sql).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].num_results, 3);
+    }
+
+    #[test]
+    fn test_parse_search_calls_query_first() {
+        let sql = "SELECT * FROM vectorize.search(query=>'camping backpack', job=>'my_job')";
+        let calls = parse_search_calls(sql).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].job_name, "my_job");
+        assert_eq!(calls[0].query, "camping backpack");
+    }
+
+    #[test]
+    fn test_parse_search_calls_none() {
+        let sql = "SELECT * FROM products WHERE id = 1";
+        let calls = parse_search_calls(sql).unwrap();
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_search_calls_escaped_quotes() {
+        let sql = "SELECT * FROM vectorize.search(job=>'it''s a job', query=>'o''malley''s bar')";
+        let calls = parse_search_calls(sql).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].job_name, "it's a job");
+        assert_eq!(calls[0].query, "o'malley's bar");
+    }
+
+    #[test]
+    fn test_parse_search_calls_paren_in_query() {
+        let sql = "SELECT * FROM vectorize.search(job=>'my_job', query=>'find func(arg)')";
+        let calls = parse_search_calls(sql).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].job_name, "my_job");
+        assert_eq!(calls[0].query, "find func(arg)");
     }
 }
