@@ -77,9 +77,10 @@ pub async fn init_vectorize(pool: &PgPool) -> Result<(), VectorizeError> {
         return Ok(());
     } else {
         // these statements are critical, so we fail if they error
+        // Note: the vectorize.job table itself is created/evolved via the
+        // vectorize-server crate's sqlx migrations (server/migrations), not here.
         let statements_nofail = vec![
             "CREATE SCHEMA IF NOT EXISTS vectorize;".to_string(),
-            query::create_vectorize_table(),
             query::handle_table_update(),
             query::create_batch_texts_fn(),
         ];
@@ -126,15 +127,16 @@ pub async fn initialize_job(
     // create the job record
     let mut tx = pool.begin().await?;
     let job_id: Uuid = sqlx::query_scalar("
-        INSERT INTO vectorize.job (job_name, src_schema, src_table, src_columns, primary_key, update_time_col, model)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO vectorize.job (job_name, src_schema, src_table, src_columns, primary_key, update_time_col, model, bm25_enabled)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (job_name) DO UPDATE SET
             src_schema = EXCLUDED.src_schema,
             src_table = EXCLUDED.src_table,
             src_columns = EXCLUDED.src_columns,
             primary_key = EXCLUDED.primary_key,
             update_time_col = EXCLUDED.update_time_col,
-            model = EXCLUDED.model
+            model = EXCLUDED.model,
+            bm25_enabled = EXCLUDED.bm25_enabled
         RETURNING id")
         .bind(job_request.job_name.clone())
         .bind(job_request.src_schema.clone())
@@ -143,6 +145,7 @@ pub async fn initialize_job(
         .bind(job_request.primary_key.clone())
         .bind(job_request.update_time_col.clone())
         .bind(job_request.model.to_string())
+        .bind(job_request.bm25_enabled)
         .fetch_one(&mut *tx)
         .await?;
 

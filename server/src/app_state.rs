@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::error;
 use vectorize_core::config::Config;
 use vectorize_core::types::VectorizeJob;
 use vectorize_worker::WorkerHealth;
 
+use crate::bm25::BM25Index;
 use crate::cache;
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +28,8 @@ pub struct AppState {
     pub job_cache: Arc<RwLock<HashMap<String, VectorizeJob>>>,
     /// worker health monitoring data
     pub worker_health: Arc<RwLock<WorkerHealth>>,
+    /// in-memory BM25 indexes keyed by job_name; rebuilt from source on startup
+    pub bm25_indexes: Arc<RwLock<HashMap<String, Arc<Mutex<BM25Index>>>>>,
 }
 
 impl AppState {
@@ -44,6 +47,10 @@ impl AppState {
         vectorize_core::init::init_project(&db_pool)
             .await
             .map_err(|e| format!("Failed to initialize project: {e}"))?;
+
+        crate::db::run_migrations(&db_pool)
+            .await
+            .map_err(|e| format!("Failed to run migrations: {e}"))?;
 
         // load initial job cache
         let job_cache = cache::load_initial_job_cache(&db_pool)
@@ -66,12 +73,61 @@ impl AppState {
             last_error: None,
         }));
 
+        // Create empty BM25 index map, then kick off background population for
+        // every job that has opted in via `bm25_enabled`, so the server stays
+        // non-blocking at startup and jobs that never asked for BM25 incur no cost.
+        let bm25_indexes: Arc<RwLock<HashMap<String, Arc<Mutex<BM25Index>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        {
+            let jobs: Vec<VectorizeJob> = {
+                let cache = job_cache.read().await;
+                cache
+                    .values()
+                    .filter(|job| job.bm25_enabled)
+                    .cloned()
+                    .collect()
+            };
+            for job in jobs {
+                if job.job_name.is_empty() {
+                    continue;
+                }
+                match BM25Index::new() {
+                    Ok(idx) => {
+                        let idx = Arc::new(Mutex::new(idx));
+                        bm25_indexes
+                            .write()
+                            .await
+                            .insert(job.job_name.clone(), idx.clone());
+                        let pool = db_pool.clone();
+                        tokio::spawn(async move {
+                            crate::bm25::populate_bm25_index(&pool, &job, idx).await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create BM25 index for job {}: {e}", job.job_name);
+                    }
+                }
+            }
+        }
+
+        // Background sync: pick up changed documents every 30 s.
+        {
+            let pool = db_pool.clone();
+            let indexes = bm25_indexes.clone();
+            let cache = job_cache.clone();
+            tokio::spawn(async move {
+                crate::bm25::start_bm25_sync_task(pool, indexes, cache).await;
+            });
+        }
+
         Ok(AppState {
             config,
             db_pool,
             cache_pool,
             job_cache,
             worker_health,
+            bm25_indexes,
         })
     }
 
